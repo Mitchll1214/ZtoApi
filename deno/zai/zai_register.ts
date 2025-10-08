@@ -1,16 +1,24 @@
+/**
+ * Z.AI账号注册管理V2
+ * 登录鉴权/批量注册/实时监控/账号管理/高级配置
+ * 存储: Deno KV
+ * @author dext7r
+ */
 
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 
+// ==================== 配置区域 ====================
+
 const PORT = 8001;  // 端口
-const NOTIFY_INTERVAL = 3600;  
-const MAX_LOGIN_ATTEMPTS = 5; 
-const LOGIN_LOCK_DURATION = 900000; 
+const NOTIFY_INTERVAL = 3600;  // 通知间隔秒
+const MAX_LOGIN_ATTEMPTS = 5;  // 最大登录失败
+const LOGIN_LOCK_DURATION = 900000;  // 锁定15分钟
 
-
+// 鉴权配置
 const AUTH_USERNAME = Deno.env.get("ZAI_USERNAME") || "admin";
 const AUTH_PASSWORD = Deno.env.get("ZAI_PASSWORD") || "123456";
 
-
+// 邮箱域名
 const DOMAINS = [
   "chatgptuk.pp.ua", "freemails.pp.ua", "email.gravityengine.cc", "gravityengine.cc",
   "3littlemiracles.com", "almiswelfare.org", "gyan-netra.com", "iraniandsa.org",
@@ -19,13 +27,17 @@ const DOMAINS = [
   "cwetg.co.uk", "goleudy.org.uk", "hhe.org.uk", "hottchurch.org.uk"
 ];
 
+// ==================== 数据存储 ====================
 
+// KV数据库
 let kv: Deno.Kv;
 
+// 配置缓存（内存）
 let configCache: any = null;
 let configCacheTime = 0;
-const CONFIG_CACHE_TTL = 60000;
+const CONFIG_CACHE_TTL = 60000; // 配置缓存60秒
 
+// KV使用统计
 const kvStats = {
   reads: 0,
   writes: 0,
@@ -36,6 +48,7 @@ const kvStats = {
   lastResetDate: new Date().toDateString()
 };
 
+// 重置每日统计
 function resetDailyStats() {
   const today = new Date().toDateString();
   if (kvStats.lastResetDate !== today) {
@@ -45,6 +58,7 @@ function resetDailyStats() {
   }
 }
 
+// 包装KV操作以统计
 async function kvGet(key: Deno.KvKey) {
   resetDailyStats();
   kvStats.reads++;
@@ -65,6 +79,7 @@ async function kvDelete(key: Deno.KvKey) {
   return await kv.delete(key);
 }
 
+// 初始化KV
 async function initKV() {
   try {
     kv = await Deno.openKv();
@@ -76,36 +91,43 @@ async function initKV() {
   }
 }
 
+// ==================== 全局状态 ====================
 
-let isRunning = false;  
-let shouldStop = false;  
-const sseClients = new Set<ReadableStreamDefaultController>();  
-let stats = { success: 0, failed: 0, startTime: 0, lastNotifyTime: 0 };
-const logHistory: any[] = [];  
-const MAX_LOG_HISTORY = 500; 
-const MAX_KV_LOG_HISTORY = 50;  
-let logSaveTimer: number | null = null;  
-const LOG_SAVE_INTERVAL = 30000; 
+let isRunning = false;  // 运行中
+let shouldStop = false;  // 停止标志
+const sseClients = new Set<ReadableStreamDefaultController>();  // SSE连接
+let stats = { success: 0, failed: 0, startTime: 0, lastNotifyTime: 0 };  // 统计
+const logHistory: any[] = [];  // 日志缓存
+const MAX_LOG_HISTORY = 500;  // 最大内存日志数
+const MAX_KV_LOG_HISTORY = 50;  // 最大KV日志数（限制64KB）
+let logSaveTimer: number | null = null;  // 日志定时器
+const LOG_SAVE_INTERVAL = 30000;  // 保存间隔30秒
 
+// 账号总数缓存
 let accountTotalCache: { count: number; lastUpdate: number } | null = null;
-const ACCOUNT_COUNT_CACHE_TTL = 60000; 
+const ACCOUNT_COUNT_CACHE_TTL = 60000;  // 缓存1分钟
 
+// 登录失败跟踪
 const loginAttempts = new Map<string, { attempts: number; lockedUntil: number }>();
 
+// 获取账号总数（带缓存）
 async function getAccountTotal(forceRefresh = false): Promise<number> {
   const now = Date.now();
 
+  // 检查缓存
   if (!forceRefresh && accountTotalCache && (now - accountTotalCache.lastUpdate < ACCOUNT_COUNT_CACHE_TTL)) {
     console.log(`📊 使用缓存的账号总数: ${accountTotalCache.count}`);
     return accountTotalCache.count;
   }
 
+  // 重新统计
   console.log(`📊 开始统计账号总数...`);
   const startTime = Date.now();
   let count = 0;
   const entries = kv.list({ prefix: ["zai_accounts"] });
   for await (const _ of entries) {
     count++;
+    // 每1000条打印一次进度
     if (count % 1000 === 0) {
       console.log(`  ... 已统计 ${count} 条`);
     }
@@ -113,19 +135,24 @@ async function getAccountTotal(forceRefresh = false): Promise<number> {
   const elapsed = Date.now() - startTime;
   console.log(`✅ 账号总数统计完成: ${count} 条 (耗时: ${elapsed}ms)`);
 
+  // 更新缓存
   accountTotalCache = { count, lastUpdate: now };
   return count;
 }
 
+// 清除账号总数缓存（在新增/删除账号时调用）
 function clearAccountTotalCache() {
   accountTotalCache = null;
 }
 
+// 批量保存日志(节流)
 async function saveLogs(): Promise<void> {
   if (logHistory.length === 0) return;
 
   try {
     const logKey = ["logs", "recent"];
+
+    // 保存最近的50条日志（限制大小避免超过64KB）
     const recentLogs = logHistory
       .slice(-MAX_KV_LOG_HISTORY)
       .map(log => ({
@@ -133,11 +160,11 @@ async function saveLogs(): Promise<void> {
         level: log.level,
         message: log.message,
         timestamp: log.timestamp
-
+        // 移除stats和link等大对象，减小存储体积
       }));
 
     if (recentLogs.length > 0) {
-      await kvSet(logKey, recentLogs, { expireIn: 3600000 });  
+      await kvSet(logKey, recentLogs, { expireIn: 3600000 });  // 1小时过期
     } else {
       await kvDelete(logKey);
     }
@@ -146,6 +173,7 @@ async function saveLogs(): Promise<void> {
   }
 }
 
+// 调度日志保存(防抖)
 function scheduleSaveLogs() {
   if (logSaveTimer) {
     clearTimeout(logSaveTimer);
@@ -157,6 +185,7 @@ function scheduleSaveLogs() {
   }, LOG_SAVE_INTERVAL);
 }
 
+// 广播消息
 function broadcast(data: any) {
   const message = `data: ${JSON.stringify(data)}\n\n`;
 
@@ -164,43 +193,50 @@ function broadcast(data: any) {
     try {
       controller.enqueue(new TextEncoder().encode(message));
     } catch (err) {
+      // SSE发送失败，移除客户端
       sseClients.delete(controller);
     }
   }
 
+  // 保存到内存
   if (data.type === 'log' || data.type === 'start' || data.type === 'complete') {
     logHistory.push({ ...data, timestamp: Date.now() });
+
+    // 清理1小时外日志
     const oneHourAgo = Date.now() - 3600000;
     while (logHistory.length > 0 && logHistory[0].timestamp < oneHourAgo) {
       logHistory.shift();
     }
 
+    // 限制最大数量
     if (logHistory.length > MAX_LOG_HISTORY) {
       logHistory.shift();
     }
 
+    // 调度批量保存
     scheduleSaveLogs();
 
+    // 完成或错误时立即保存
     if (data.type === 'complete' || (data.type === 'log' && data.level === 'error')) {
       saveLogs().catch(() => {});
     }
   }
 }
 
-
+// 生成SessionID
 function generateSessionId(): string {
   return crypto.randomUUID();
 }
 
-
+// 获取客户端IP
 function getClientIP(req: Request): string {
-
+  // X-Forwarded-For
   const forwarded = req.headers.get("X-Forwarded-For");
   if (forwarded) {
     return forwarded.split(',')[0].trim();
   }
 
-
+  // X-Real-IP
   const realIP = req.headers.get("X-Real-IP");
   if (realIP) {
     return realIP;
@@ -209,6 +245,7 @@ function getClientIP(req: Request): string {
   return "unknown";
 }
 
+// 检查IP锁定
 function checkIPLocked(ip: string): { locked: boolean; remainingTime?: number } {
   const record = loginAttempts.get(ip);
   if (!record) {
@@ -223,10 +260,12 @@ function checkIPLocked(ip: string): { locked: boolean; remainingTime?: number } 
     };
   }
 
+  // 过期清除
   loginAttempts.delete(ip);
   return { locked: false };
 }
 
+// 记录登录失败
 function recordLoginFailure(ip: string): void {
   const record = loginAttempts.get(ip) || { attempts: 0, lockedUntil: 0 };
   record.attempts++;
@@ -238,64 +277,73 @@ function recordLoginFailure(ip: string): void {
   loginAttempts.set(ip, record);
 }
 
+// 清除登录失败
 function clearLoginFailure(ip: string): void {
   loginAttempts.delete(ip);
 }
 
+// 注册配置
 let registerConfig = {
-  emailTimeout: 300, 
-  emailCheckInterval: 5, 
-  registerDelay: 2000,  
-  retryTimes: 3,  
-  concurrency: 15,  
-  httpTimeout: 30,  
-  batchSaveSize: 10,  
-  connectionPoolSize: 100, 
-  skipApikeyOnRegister: false,  
-  enableNotification: false,  
-  pushplusToken: "",  
+  emailTimeout: 300,  // 邮件检查超时(秒) - 5分钟足够接收验证码
+  emailCheckInterval: 5,  // 邮件检查间隔(秒) - 5秒平衡速度和请求频率
+  registerDelay: 2000,  // 注册间隔(毫秒) - 2秒更稳定，降低被封风险
+  retryTimes: 3,  // 重试次数 - 3次重试合理
+  concurrency: 15,  // 最大并发数 (1-100) - 15个并发平衡速度和稳定性
+  httpTimeout: 30,  // HTTP请求超时(秒)
+  batchSaveSize: 10,  // 批量保存大小 - 每10个账号批量写入KV
+  connectionPoolSize: 100,  // 连接池大小（预留配置）
+  skipApikeyOnRegister: false,  // 快速模式：注册时跳过APIKEY获取，稍后批量获取
+  enableNotification: false,  // 通知默认关闭
+  pushplusToken: "",  // PushPlus Token
 };
 
-
+// 从KV加载配置（带缓存）
 async function loadConfigFromKV() {
   const now = Date.now();
 
+  // 如果缓存有效，直接返回
   if (configCache && (now - configCacheTime) < CONFIG_CACHE_TTL) {
     return configCache;
   }
 
-
+  // 从KV读取
   const configKey = ["config", "register"];
   const entry = await kvGet(configKey);
 
   if (entry.value) {
     configCache = entry.value;
     configCacheTime = now;
-
+    // 更新全局registerConfig
     registerConfig = { ...registerConfig, ...entry.value };
     return entry.value;
   }
 
+  // 如果KV中没有，返回默认配置
   configCache = registerConfig;
   configCacheTime = now;
   return registerConfig;
 }
 
+// 保存配置并更新缓存
 async function saveConfigToKV(config: any) {
   const configKey = ["config", "register"];
   await kvSet(configKey, config);
+  // 更新缓存
   configCache = config;
   configCacheTime = Date.now();
+  // 更新全局registerConfig
   registerConfig = { ...registerConfig, ...config };
 }
 
+// 批量保存账号（使用atomic）
 async function batchSaveAccounts(accounts: Array<{ email: string; password: string; token: string; apikey?: string; createdAt?: string; status?: string }>) {
   if (accounts.length === 0) return { success: 0, failed: 0 };
 
-  const BATCH_SIZE = 10; 
+  const BATCH_SIZE = 10; // 每批最多10个（Deno KV atomic限制）
   let success = 0;
   let failed = 0;
 
+  // 分批处理
   for (let i = 0; i < accounts.length; i += BATCH_SIZE) {
     const batch = accounts.slice(i, i + BATCH_SIZE);
 
@@ -316,6 +364,8 @@ async function batchSaveAccounts(accounts: Array<{ email: string; password: stri
       }
 
       await atomic.commit();
+
+      // 统计写入次数（atomic算一次写入）
       kvStats.writes++;
       kvStats.dailyWrites++;
       resetDailyStats();
@@ -324,6 +374,8 @@ async function batchSaveAccounts(accounts: Array<{ email: string; password: stri
     } catch (error) {
       console.error("批量保存失败:", error);
       failed += batch.length;
+
+      // 如果批量失败，尝试单个保存
       for (const acc of batch) {
         try {
           const timestamp = Date.now();
@@ -348,16 +400,21 @@ async function batchSaveAccounts(accounts: Array<{ email: string; password: stri
   return { success, failed };
 }
 
+// 内存去重缓存
 let emailCacheSet: Set<string> | null = null;
 let emailCacheTime = 0;
-const EMAIL_CACHE_TTL = 300000; 
+const EMAIL_CACHE_TTL = 300000; // 邮箱缓存5分钟
+
+// 加载所有邮箱到内存（用于快速去重）
 async function loadEmailCache(): Promise<Set<string>> {
   const now = Date.now();
 
+  // 如果缓存有效，直接返回
   if (emailCacheSet && (now - emailCacheTime) < EMAIL_CACHE_TTL) {
     return emailCacheSet;
   }
 
+  // 重新加载
   const emails = new Set<string>();
   const entries = kv.list({ prefix: ["zai_accounts"] });
 
@@ -370,29 +427,40 @@ async function loadEmailCache(): Promise<Set<string>> {
 
   emailCacheSet = emails;
   emailCacheTime = now;
+
+  // 这次list操作计为一次读取
   kvStats.reads++;
   kvStats.dailyReads++;
   resetDailyStats();
 
   return emails;
 }
+
+// 清除邮箱缓存（在添加/删除账号后调用）
 function invalidateEmailCache() {
   emailCacheSet = null;
   emailCacheTime = 0;
 }
 
+// 快速检查邮箱是否存在
 async function isEmailExists(email: string): Promise<boolean> {
   const cache = await loadEmailCache();
   return cache.has(email);
 }
 
 
+
+
+// ==================== 鉴权相关 ====================
+
+// 检查请求认证
 async function checkAuth(req: Request): Promise<{ authenticated: boolean; sessionId?: string }> {
   const cookies = req.headers.get("Cookie") || "";
   const sessionMatch = cookies.match(/sessionId=([^;]+)/);
 
   if (sessionMatch) {
     const sessionId = sessionMatch[1];
+    // KV检查session
     const sessionKey = ["sessions", sessionId];
     const session = await kvGet(sessionKey);
 
@@ -404,6 +472,9 @@ async function checkAuth(req: Request): Promise<{ authenticated: boolean; sessio
   return { authenticated: false };
 }
 
+// ==================== 工具函数 ====================
+
+// 生成随机邮箱
 function createEmail(): string {
   const randomHex = Array.from({ length: 12 }, () =>
     Math.floor(Math.random() * 16).toString(16)
@@ -412,6 +483,7 @@ function createEmail(): string {
   return `${randomHex}@${domain}`;
 }
 
+// 生成随机密码
 function createPassword(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
   return Array.from({ length: 14 }, () =>
@@ -419,7 +491,9 @@ function createPassword(): string {
   ).join('');
 }
 
+// PushPlus通知
 async function sendNotification(title: string, content: string): Promise<void> {
+  // 检查配置
   if (!registerConfig.enableNotification || !registerConfig.pushplusToken) return;
 
   try {
@@ -434,9 +508,11 @@ async function sendNotification(title: string, content: string): Promise<void> {
       })
     });
   } catch {
+    // 忽略错误
   }
 }
 
+// 获取验证邮件
 async function fetchVerificationEmail(email: string): Promise<string | null> {
   const actualTimeout = registerConfig.emailTimeout;
   const checkInterval = registerConfig.emailCheckInterval;
@@ -447,6 +523,7 @@ async function fetchVerificationEmail(email: string): Promise<string | null> {
   let lastReportTime = 0;
   const reportInterval = 10;
 
+  // 格式化时间
   const formatTime = (seconds: number): string => {
     if (seconds < 60) return `${seconds}s`;
     const mins = Math.floor(seconds / 60);
@@ -455,6 +532,7 @@ async function fetchVerificationEmail(email: string): Promise<string | null> {
   };
 
   while (Date.now() - startTime < actualTimeout * 1000) {
+    // 检查是否被停止
     if (shouldStop) {
       broadcast({ type: 'log', level: 'warning', message: `  ⚠️ 任务已停止，中断邮件等待` });
       return null;
@@ -465,6 +543,7 @@ async function fetchVerificationEmail(email: string): Promise<string | null> {
       const response = await fetch(apiUrl, { signal: AbortSignal.timeout(10000) });
       const data = await response.json();
 
+      // 每10秒报告
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       if (elapsed - lastReportTime >= reportInterval && elapsed > 0) {
         const progress = Math.min(Math.floor((elapsed / actualTimeout) * 100), 99);
@@ -486,6 +565,7 @@ async function fetchVerificationEmail(email: string): Promise<string | null> {
         }
       }
     } catch {
+      // 重试
     }
     await new Promise(resolve => setTimeout(resolve, checkInterval * 1000));
   }
@@ -507,6 +587,7 @@ function parseVerificationUrl(url: string): { token: string | null; email: strin
   }
 }
 
+// API登录
 async function loginToApi(token: string): Promise<string | null> {
   const url = 'https://api.z.ai/api/auth/z/login';
   const headers = {
@@ -540,6 +621,7 @@ async function loginToApi(token: string): Promise<string | null> {
   }
 }
 
+// 获取客户信息
 async function getCustomerInfo(accessToken: string): Promise<{ orgId: string | null; projectId: string | null }> {
   const url = 'https://api.z.ai/api/biz/customer/getCustomerInfo';
   const headers = {
@@ -578,6 +660,7 @@ async function getCustomerInfo(accessToken: string): Promise<{ orgId: string | n
   }
 }
 
+// 创建APIKEY
 async function createApiKey(accessToken: string, orgId: string, projectId: string): Promise<string | null> {
   const url = `https://api.z.ai/api/biz/v1/organization/${orgId}/projects/${projectId}/api_keys`;
   const headers = {
@@ -614,10 +697,12 @@ async function createApiKey(accessToken: string, orgId: string, projectId: strin
   }
 }
 
+// 清理Token
 function cleanToken(token: string): string {
   return token.includes('----') ? token.split('----')[0].trim() : token.trim();
 }
 
+// 检查账号有效性
 async function checkAccountStatus(token: string): Promise<boolean> {
   try {
     const accessToken = await loginToApi(cleanToken(token));
@@ -639,7 +724,9 @@ async function saveAccount(email: string, password: string, token: string, apike
       status: status,
       createdAt: new Date().toISOString()
     });
+    // 清除邮箱缓存
     invalidateEmailCache();
+    // 清除账号总数缓存
     clearAccountTotalCache();
     return true;
   } catch (error) {
@@ -666,6 +753,7 @@ interface RegisterResult {
 
 async function registerAccount(): Promise<RegisterResult> {
   try {
+    // 检查是否被停止
     if (shouldStop) {
       return { success: false };
     }
@@ -682,6 +770,7 @@ async function registerAccount(): Promise<RegisterResult> {
       link: { text: '邮箱', url: emailCheckUrl }
     });
 
+    // 1. 注册
     broadcast({ type: 'log', level: 'info', message: `  → 注册...` });
     const signupResponse = await fetch("https://chat.z.ai/api/v1/auths/signup", {
       method: "POST",
@@ -704,6 +793,8 @@ async function registerAccount(): Promise<RegisterResult> {
     }
 
     broadcast({ type: 'log', level: 'success', message: `  ✓ 注册成功` });
+
+    // 2. 获取验证邮件
     broadcast({
       type: 'log',
       level: 'info',
@@ -715,23 +806,25 @@ async function registerAccount(): Promise<RegisterResult> {
       stats.failed++;
       return { success: false };
     }
+
+    // 再次检查是否被停止
     if (shouldStop) {
       return { success: false };
     }
 
-
+    // 3. 提取验证链接
     broadcast({ type: 'log', level: 'info', message: `  → 提取链接...` });
 
-
+    // 多种匹配
     let verificationUrl = null;
 
-
+    // 方式1: /auth/verify_email
     let match = emailContent.match(/https:\/\/chat\.z\.ai\/auth\/verify_email\?[^\s<>"']+/);
     if (match) {
       verificationUrl = match[0].replace(/&amp;/g, '&').replace(/&#39;/g, "'");
     }
 
-
+    // 方式2: /verify_email
     if (!verificationUrl) {
       match = emailContent.match(/https:\/\/chat\.z\.ai\/verify_email\?[^\s<>"']+/);
       if (match) {
@@ -740,6 +833,7 @@ async function registerAccount(): Promise<RegisterResult> {
       }
     }
 
+    // 方式3: HTML编码
     if (!verificationUrl) {
       match = emailContent.match(/https?:\/\/chat\.z\.ai\/(?:auth\/)?verify_email[^"'\s]*/);
       if (match) {
@@ -748,6 +842,7 @@ async function registerAccount(): Promise<RegisterResult> {
       }
     }
 
+    // 方式4: JSON格式
     if (!verificationUrl) {
       try {
         const urlMatch = emailContent.match(/"(https?:\/\/[^"]*verify_email[^"]*)"/);
@@ -756,7 +851,7 @@ async function registerAccount(): Promise<RegisterResult> {
           broadcast({ type: 'log', level: 'success', message: `  ✓ JSON格式` });
         }
       } catch (e) {
-
+        // 忽略
       }
     }
 
@@ -777,7 +872,7 @@ async function registerAccount(): Promise<RegisterResult> {
 
     broadcast({ type: 'log', level: 'success', message: `  ✓ 链接已提取` });
 
-
+    // 4. 完成注册
     broadcast({ type: 'log', level: 'info', message: `  → 验证...` });
     const finishResponse = await fetch("https://chat.z.ai/api/v1/auths/finish_signup", {
       method: "POST",
@@ -799,6 +894,7 @@ async function registerAccount(): Promise<RegisterResult> {
       return { success: false };
     }
 
+    // 5. 获取Token
     const userToken = finishResult.user?.token;
     if (!userToken) {
       broadcast({ type: 'log', level: 'error', message: `  ✗ 无Token` });
@@ -808,6 +904,7 @@ async function registerAccount(): Promise<RegisterResult> {
 
     broadcast({ type: 'log', level: 'success', message: `  ✓ 获得Token` });
 
+    // 快速模式：跳过APIKEY获取，稍后批量获取
     if (registerConfig.skipApikeyOnRegister) {
       const account = { email, password, token: userToken, apikey: null, createdAt: new Date().toISOString() };
       const saved = await saveAccount(email, password, userToken);
@@ -837,6 +934,8 @@ async function registerAccount(): Promise<RegisterResult> {
       return { success: true, account };
     }
 
+    // 正常模式：立即获取APIKEY
+    // 6. API登录
     broadcast({ type: 'log', level: 'info', message: `  → 登录API...` });
     const accessToken = await loginToApi(userToken);
     if (!accessToken) {
@@ -868,6 +967,7 @@ async function registerAccount(): Promise<RegisterResult> {
       return { success: true, account };
     }
 
+    // 7. 获取组织
     broadcast({ type: 'log', level: 'info', message: `  → 组织...` });
     const { orgId, projectId } = await getCustomerInfo(accessToken);
     if (!orgId || !projectId) {
@@ -899,9 +999,11 @@ async function registerAccount(): Promise<RegisterResult> {
       return { success: true, account };
     }
 
+    // 8. 创建APIKEY
     broadcast({ type: 'log', level: 'info', message: `  → APIKEY...` });
     const apiKey = await createApiKey(accessToken, orgId, projectId);
 
+    // 9. 保存
     const account = { email, password, token: userToken, apikey: apiKey || null, createdAt: new Date().toISOString() };
     const saved = await saveAccount(email, password, userToken, apiKey || undefined);
 
@@ -969,10 +1071,12 @@ async function batchRegister(count: number): Promise<void> {
   let completed = 0;
   const successAccounts: Array<{ email: string; password: string; token: string; apikey: string | null }> = [];
 
+  // 并发注册
   while (completed < count && !shouldStop) {
     const batchSize = Math.min(concurrency, count - completed);
     const batchPromises: Promise<RegisterResult>[] = [];
 
+    // 创建任务
     for (let i = 0; i < batchSize; i++) {
       const taskIndex = completed + i + 1;
       const progress = Math.floor((taskIndex / count) * 100);
@@ -981,6 +1085,7 @@ async function batchRegister(count: number): Promise<void> {
       const remaining = count - taskIndex;
       const eta = avgTimePerAccount > 0 ? Math.ceil(remaining * avgTimePerAccount) : 0;
 
+      // 格式化时间
       const formatTime = (seconds: number): string => {
         if (seconds < 60) return `${seconds}s`;
         const mins = Math.floor(seconds / 60);
@@ -996,7 +1101,10 @@ async function batchRegister(count: number): Promise<void> {
       batchPromises.push(registerAccount());
     }
 
+    // 等待完成
     const results = await Promise.allSettled(batchPromises);
+
+    // 收集成功账号
     for (const result of results) {
       if (result.status === 'fulfilled' && result.value.success && result.value.account) {
         successAccounts.push(result.value.account);
@@ -1005,6 +1113,7 @@ async function batchRegister(count: number): Promise<void> {
 
     completed += batchSize;
 
+    // 批次完成后显示详细统计
     const currentBatch = Math.ceil(completed / concurrency);
     const totalBatches = Math.ceil(count / concurrency);
     const elapsed = Math.floor((Date.now() - stats.startTime) / 1000);
@@ -1024,6 +1133,7 @@ async function batchRegister(count: number): Promise<void> {
       message: `\n📊 批次 ${currentBatch}/${totalBatches} 完成 | 进度: ${completed}/${count} (${progress}%) | 成功率: ${successRate}% | 耗时: ${formatTime(elapsed)}`
     });
 
+    // 批次延迟
     if (completed < count && !shouldStop) {
       await new Promise(resolve => setTimeout(resolve, registerConfig.registerDelay));
     }
@@ -1040,7 +1150,7 @@ async function batchRegister(count: number): Promise<void> {
     stats: { success: stats.success, failed: stats.failed, total: stats.success + stats.failed, elapsedTime: elapsedTime.toFixed(1) }
   });
 
-
+  // 总账号数
   let totalAccounts = 0;
   try {
     const entries = kv.list({ prefix: ["zai_accounts"] });
@@ -1051,6 +1161,7 @@ async function batchRegister(count: number): Promise<void> {
     // 忽略
   }
 
+  // 详情(最多10个)
   let accountsDetail = '';
   if (successAccounts.length > 0) {
     accountsDetail += '\n\n### 📋 详情\n';
@@ -1069,6 +1180,7 @@ async function batchRegister(count: number): Promise<void> {
     }
   }
 
+  // 发送通知
   await sendNotification(
     "✅ Z.AI注册完成",
     `## ✅ Z.AI注册完成
@@ -1093,6 +1205,7 @@ async function batchRegister(count: number): Promise<void> {
   shouldStop = false;
 }
 
+// 登录页面
 const LOGIN_PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1166,18 +1279,20 @@ const LOGIN_PAGE = `<!DOCTYPE html>
     </div>
 
     <script>
-
+        // 加载公开KV统计
         async function loadPublicKVStats() {
             try {
                 const response = await fetch('/api/kv-stats');
                 const stats = await response.json();
 
+                // 更新UI
                 document.getElementById('publicKvWrites').textContent = stats.daily.writes.toLocaleString();
                 document.getElementById('publicKvReads').textContent = stats.daily.reads.toLocaleString();
                 document.getElementById('publicKvWritesPercent').textContent = stats.quota.writesPercent;
                 document.getElementById('publicKvReadsPercent').textContent = stats.quota.readsPercent;
                 document.getElementById('publicKvUptime').textContent = stats.session.uptime;
 
+                // 更新状态
                 const statusEl = document.getElementById('publicKvStatus');
                 if (stats.warnings && stats.warnings.length > 0) {
                     statusEl.className = 'inline-flex items-center px-3 py-1 rounded-full text-[10px] font-medium bg-orange-100 text-orange-700';
@@ -1191,8 +1306,10 @@ const LOGIN_PAGE = `<!DOCTYPE html>
             }
         }
 
+        // 页面加载时获取统计
         loadPublicKVStats();
 
+        // 每30秒刷新一次
         setInterval(loadPublicKVStats, 30000);
 
         document.getElementById('loginForm').addEventListener('submit', async (e) => {
@@ -1217,16 +1334,16 @@ const LOGIN_PAGE = `<!DOCTYPE html>
                     document.cookie = 'sessionId=' + result.sessionId + '; path=/; max-age=86400';
                     window.location.href = '/';
                 } else {
-
+                    // 显示错误信息
                     let errorText = result.error || '登录失败';
 
-
+                    // 如果账号被锁定，显示剩余时间
                     if (result.code === 'ACCOUNT_LOCKED' && result.remainingTime) {
                         const minutes = Math.floor(result.remainingTime / 60);
                         const seconds = result.remainingTime % 60;
                         errorText += ' (' + minutes + '分' + seconds + '秒后可重试)';
                     }
-
+                    // 如果有剩余尝试次数，显示提示
                     else if (result.attemptsRemaining !== undefined) {
                         errorText += ' (剩余 ' + result.attemptsRemaining + ' 次尝试机会)';
                     }
@@ -1243,6 +1360,7 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// 主页面
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1263,6 +1381,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         .toast-enter { animation: slideIn 0.3s ease-out; }
         .toast-exit { animation: slideOut 0.3s ease-in; }
 
+        /* 移动端优化 */
         @media (max-width: 768px) {
             .mobile-scroll {
                 overflow-x: auto;
@@ -1474,7 +1593,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 </div>
             </div>
 
-
+            <!-- 高级设置面板 -->
             <div id="settingsPanel" class="mb-6 p-4 bg-gray-50 rounded-lg hidden">
                 <h3 class="font-semibold text-gray-700 mb-4">⚙️ 高级设置</h3>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1566,6 +1685,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 </button>
             </div>
 
+            <!-- 进度条 -->
             <div id="progressContainer" style="display: none;" class="mb-4">
                 <div class="flex justify-between text-sm text-gray-600 mb-2">
                     <span>注册进度</span>
@@ -1583,6 +1703,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- 统计面板 -->
         <div class="bg-white rounded-2xl shadow-2xl p-3 sm:p-6 mb-4 sm:mb-6">
             <h2 class="text-xl sm:text-2xl font-bold text-gray-800 mb-3 sm:mb-4">统计信息 <span class="text-sm text-gray-500 font-normal">(点击切换显示)</span></h2>
             <div class="grid grid-cols-2 md:grid-cols-5 gap-2 sm:gap-4">
@@ -1616,6 +1737,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 </div>
             </div>
 
+            <!-- KV统计信息（可折叠） -->
             <div class="mt-4 border-t border-gray-200 pt-4">
                 <button id="kvStatsToggle" class="text-sm text-gray-600 hover:text-gray-800 font-medium flex items-center gap-2">
                     <span>📊 KV存储统计</span>
@@ -1692,10 +1814,13 @@ const HTML_PAGE = `<!DOCTYPE html>
                         🔄 同步到服务器
                     </button>
 
+                    <!-- APIKEY批量操作 -->
                     <button id="batchRefetchApikeyBtn"
                         class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-pink-500 to-rose-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
                         🔑 批量补充APIKEY
                     </button>
+
+                    <!-- 存活性检测 -->
                     <button id="batchCheckAccountsBtn"
                         class="flex-1 sm:flex-none px-3 sm:px-4 py-2 bg-gradient-to-r from-yellow-500 to-orange-600 text-white font-semibold rounded-lg shadow hover:shadow-lg transition text-xs sm:text-sm whitespace-nowrap">
                         🔍 批量检测存活
@@ -1713,6 +1838,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 </div>
             </div>
 
+            <!-- 快速筛选标签 -->
             <div class="flex flex-wrap gap-2 mb-4">
                 <span class="text-sm text-gray-600 font-medium self-center">快速筛选:</span>
                 <button class="quick-filter-btn px-3 py-1 text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-full transition" data-filter="today">
@@ -1735,6 +1861,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 </button>
             </div>
 
+            <!-- 批量操作按钮区域 -->
             <div id="batchActionsBar" class="hidden mb-4 p-3 bg-indigo-50 rounded-lg border-2 border-indigo-200">
                 <div class="flex flex-wrap gap-2">
                     <button id="batchDeleteBtn" class="px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-semibold rounded-lg transition text-sm">
@@ -1781,6 +1908,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                     </tbody>
                 </table>
             </div>
+            <!-- 分页控件 -->
             <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mt-4 px-2 sm:px-4">
                 <div class="text-xs sm:text-sm text-gray-600">
                     共 <span id="totalItems">0</span> 条数据
@@ -1803,6 +1931,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- 实时日志 -->
         <div class="bg-white rounded-2xl shadow-2xl p-3 sm:p-6">
             <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4">
                 <h2 class="text-xl sm:text-2xl font-bold text-gray-800">实时日志</h2>
@@ -1819,10 +1948,10 @@ const HTML_PAGE = `<!DOCTYPE html>
 
     <script>
         let accounts = [];
-        let totalAccountsFromServer = 0;  
+        let totalAccountsFromServer = 0;  // 服务器返回的真实总数
         let filteredAccounts = [];
-        let selectedEmails = new Set(); 
-        let quickFilterMode = null; 
+        let selectedEmails = new Set(); // 存储选中的账号邮箱
+        let quickFilterMode = null; // 快速筛选模式
         let isRunning = false;
         let currentPage = 1;
         let pageSize = 20;
@@ -1830,6 +1959,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         let totalTaskCount = 0;
         let filterMode = 'all'; // 'all', 'local', 'with-apikey', 'without-apikey'
 
+        // 前端配置缓存（与后端默认值保持一致）
         let clientConfig = {
             concurrency: 15,
             registerDelay: 2000
@@ -1852,7 +1982,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         const $progressSpeed = $('#progressSpeed');
         const $progressETA = $('#progressETA');
 
-
+        // 更新进度条
         function updateProgress(current, total, success, failed) {
             const completed = success + failed;
             const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
@@ -1861,6 +1991,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             $progressPercent.text(percent + '%');
             $progressText.text(completed + '/' + total + ' (' + percent + '%)');
 
+            // 计算速度和预计剩余时间
             if (taskStartTime > 0 && completed > 0) {
                 const elapsed = (Date.now() - taskStartTime) / 1000 / 60; // 分钟
                 const speed = completed / elapsed;
@@ -1881,7 +2012,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-
+        // Toast 消息提示
         function showToast(message, type = 'info') {
             const colors = {
                 success: 'bg-green-500',
@@ -1903,7 +2034,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
             $('#toastContainer').append($toast);
 
-
+            // 限制最多保留3条通知，超过则移除最旧的
             const $toasts = $('#toastContainer').children();
             if ($toasts.length > 3) {
                 $toasts.first().remove();
@@ -1921,6 +2052,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
             let html = '<span class="text-gray-500">[' + time + ']</span> ' + message;
 
+            // 添加链接（优化样式，更醒目）
             if (link && link.url) {
                 html += ' <a href="' + link.url + '" target="_blank" class="inline-flex items-center ml-2 px-2 py-0.5 bg-cyan-600/20 text-cyan-400 hover:text-cyan-300 hover:bg-cyan-600/30 rounded border border-cyan-500/30 text-xs font-medium transition">' +
                     '<svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>' +
@@ -1952,6 +2084,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         }
 
         function renderTable() {
+            // 根据过滤模式应用过滤
             let displayData = filteredAccounts;
             if (filterMode === 'local') {
                 displayData = filteredAccounts.filter(acc => acc.source === 'local');
@@ -1972,10 +2105,12 @@ const HTML_PAGE = `<!DOCTYPE html>
                 const rows = pageData.map((acc, idx) => {
                     const rowId = 'row-' + (startIndex + idx);
                     const accountEmail = acc.email;
+                    // 处理APIKEY显示
                     const apikeyDisplay = acc.apikey ?
                         '<code class="bg-indigo-50 text-indigo-700 px-2 py-1 rounded text-xs font-mono">' + acc.apikey.substring(0, 20) + '...</code>' :
                         '<span class="text-gray-400 text-xs italic">未生成</span>';
 
+                    // 处理状态显示
                     const status = acc.status || 'active';
                     const statusDisplay = status === 'active' ?
                         '<span class="px-2 py-1 bg-green-100 text-green-700 rounded-full text-xs font-medium">✓ 正常</span>' :
@@ -2005,7 +2140,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 });
                 $accountTableBody.html(rows.join(''));
 
-
+                // 绑定单元格点击复制事件
                 $('.clickable-cell').on('click', function() {
                     const copyText = $(this).data('copy');
                     if (copyText) {
@@ -2016,6 +2151,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                     }
                 });
 
+                // 绑定"复制全部"按钮事件
                 $('.copy-full-btn').on('click', function() {
                     const email = $(this).data('email');
                     const password = $(this).data('password');
@@ -2023,6 +2159,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                     const apikey = $(this).data('apikey');
                     const createdAt = $(this).data('createdat');
 
+                    // 构建完整的账号信息
                     let fullInfo = '邮箱: ' + email + '\\n密码: ' + password + '\\n';
                     fullInfo += 'Token: ' + token + '\\n';
                     if (apikey) {
@@ -2034,18 +2171,20 @@ const HTML_PAGE = `<!DOCTYPE html>
                     showToast('已复制完整账号信息', 'success');
                 });
 
+                // 绑定"获取APIKEY"按钮事件
                 $('.refetch-apikey-btn').on('click', async function() {
                     const email = $(this).data('email');
                     const token = $(this).data('token');
                     $(this).prop('disabled', true).text('获取中...');
                     await refetchSingleApikey(email, token);
+                    // loadAccounts会重新渲染表格，按钮会自动恢复
                 });
             }
 
-
+            // 更新分页控件
             updatePagination(displayData.length, totalPages);
 
-
+            // 恢复复选框状态
             $('.row-checkbox').each(function() {
                 const email = $(this).data('email');
                 if (selectedEmails.has(email)) {
@@ -2053,13 +2192,13 @@ const HTML_PAGE = `<!DOCTYPE html>
                 }
             });
 
-
+            // 更新全选复选框状态
             updateSelectAllCheckbox();
 
-
+            // 更新选中计数
             updateSelectionUI();
 
- 
+            // 控制本地操作按钮的显示
             if (filterMode === 'local') {
                 $('.local-operation-btn').show();
             } else {
@@ -2070,11 +2209,11 @@ const HTML_PAGE = `<!DOCTYPE html>
         function updatePagination(totalItems, totalPages) {
             $('#totalItems').text(totalItems);
 
-  
+            // 更新按钮状态
             $('#firstPageBtn, #prevPageBtn').prop('disabled', currentPage === 1);
             $('#nextPageBtn, #lastPageBtn').prop('disabled', currentPage === totalPages || totalPages === 0);
 
-       
+            // 渲染页码
             const $pageNumbers = $('#pageNumbers');
             $pageNumbers.empty();
 
@@ -2111,7 +2250,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             container.append($btn);
         }
 
- 
+        // 更新全选复选框状态
         function updateSelectAllCheckbox() {
             const visibleCheckboxes = $('.row-checkbox');
             if (visibleCheckboxes.length === 0) {
@@ -2128,7 +2267,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-   
+        // 更新选择状态UI
         function updateSelectionUI() {
             const count = selectedEmails.size;
             if (count > 0) {
@@ -2140,7 +2279,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-
+        // 获取选中的完整账号对象
         function getSelectedAccounts() {
             return accounts.filter(acc => selectedEmails.has(acc.email));
         }
@@ -2152,12 +2291,12 @@ const HTML_PAGE = `<!DOCTYPE html>
             accounts = data.accounts || [];
             filteredAccounts = accounts;
 
-       
+            // 保存服务器返回的真实总数
             if (data.pagination && data.pagination.total) {
                 totalAccountsFromServer = data.pagination.total;
             }
 
-          
+            // 显示总数（使用服务器的真实总数）
             if (totalAccountsFromServer > 0) {
                 $totalAccounts.text(totalAccountsFromServer + ' (当前加载: ' + accounts.length + ')');
             } else {
@@ -2166,17 +2305,17 @@ const HTML_PAGE = `<!DOCTYPE html>
 
             currentPage = 1;
 
-       
+            // 加载并合并本地账号
             await loadLocalAccounts();
         }
 
-    
+        // 加载KV统计
         async function loadKVStats() {
             try {
                 const response = await fetch('/api/kv-stats');
                 const stats = await response.json();
 
-          
+                // 更新UI
                 $('#kvDailyWrites').text(stats.daily.writes);
                 $('#kvDailyReads').text(stats.daily.reads);
                 $('#kvWritesPercent').text(stats.quota.writesPercent);
@@ -2185,25 +2324,25 @@ const HTML_PAGE = `<!DOCTYPE html>
                 $('#kvSessionReads').text(stats.session.reads);
                 $('#kvUptime').text(stats.session.uptime);
 
-        
+                // 显示警告
                 if (stats.warnings && stats.warnings.length > 0) {
                     $('#kvWarnings').html(stats.warnings.join('<br>')).addClass('text-orange-600 font-medium');
                 } else {
                     $('#kvWarnings').text('✓ 正常').removeClass('text-orange-600 font-medium');
                 }
             } catch (error) {
-                
+                // 加载KV统计失败
             }
         }
 
-    
+        // KV统计折叠/展开
         $('#kvStatsToggle').on('click', function() {
             const panel = $('#kvStatsPanel');
             const icon = $('#kvStatsToggleIcon');
             if (panel.hasClass('hidden')) {
                 panel.removeClass('hidden');
                 icon.text('▲');
-                loadKVStats(); 
+                loadKVStats(); // 展开时加载
             } else {
                 panel.addClass('hidden');
                 icon.text('▼');
@@ -2216,11 +2355,11 @@ const HTML_PAGE = `<!DOCTYPE html>
             applyFilters(keyword);
         });
 
-   
+        // 应用筛选（搜索+快速筛选）
         function applyFilters(searchKeyword = '') {
             let result = accounts;
 
-  
+            // 应用快速筛选
             if (quickFilterMode) {
                 const now = new Date();
                 const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -2245,7 +2384,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 }
             }
 
-
+            // 应用搜索关键词
             if (searchKeyword) {
                 result = result.filter(acc => {
                     return acc.email.toLowerCase().includes(searchKeyword) ||
@@ -2260,7 +2399,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             renderTable();
         }
 
-
+        // 分页按钮事件
         $('#firstPageBtn').on('click', () => { currentPage = 1; renderTable(); });
         $('#prevPageBtn').on('click', () => { if (currentPage > 1) { currentPage--; renderTable(); } });
         $('#nextPageBtn').on('click', () => { const totalPages = Math.ceil(filteredAccounts.length / pageSize); if (currentPage < totalPages) { currentPage++; renderTable(); } });
@@ -2271,7 +2410,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             renderTable();
         });
 
-
+        // 全选复选框事件
         $('#selectAllCheckbox').on('change', function() {
             const isChecked = $(this).prop('checked');
             $('.row-checkbox').each(function() {
@@ -2287,7 +2426,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             updateSelectionUI();
         });
 
-
+        // 单行复选框事件（使用事件委托）
         $accountTableBody.on('change', '.row-checkbox', function() {
             const email = $(this).data('email');
             if ($(this).prop('checked')) {
@@ -2299,7 +2438,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             updateSelectionUI();
         });
 
-
+        // 取消选择按钮
         $('#cancelSelectionBtn').on('click', function() {
             selectedEmails.clear();
             $('.row-checkbox').prop('checked', false);
@@ -2307,7 +2446,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             updateSelectionUI();
         });
 
-    
+        // 批量删除按钮
         $('#batchDeleteBtn').on('click', async function() {
             const selected = getSelectedAccounts();
             if (selected.length === 0) {
@@ -2321,13 +2460,13 @@ const HTML_PAGE = `<!DOCTYPE html>
             $(this).prop('disabled', true).text('删除中...');
             let successCount = 0;
 
- 
+            // 获取并发数配置
             const concurrency = clientConfig.concurrency || 10;
             const total = selected.length;
 
             addLog('开始批量删除：' + total + ' 个账号，并发数：' + concurrency, 'info');
 
-       
+            // 并发删除
             for (let i = 0; i < selected.length; i += concurrency) {
                 const batch = selected.slice(i, i + concurrency);
                 const batchPromises = batch.map(async (acc) => {
@@ -2360,7 +2499,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             renderTable();
         });
 
-
+        // 批量导出CSV按钮
         $('#batchExportCsvBtn').on('click', function() {
             const selected = getSelectedAccounts();
             if (selected.length === 0) {
@@ -2382,7 +2521,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             showToast('已导出 ' + selected.length + ' 个账号到CSV', 'success');
         });
 
-
+        // 批量导出JSON按钮
         $('#batchExportJsonBtn').on('click', function() {
             const selected = getSelectedAccounts();
             if (selected.length === 0) {
@@ -2400,7 +2539,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             showToast('已导出 ' + selected.length + ' 个账号到JSON', 'success');
         });
 
-
+        // 批量复制邮箱按钮
         $('#batchCopyEmailsBtn').on('click', function() {
             const selected = getSelectedAccounts();
             if (selected.length === 0) {
@@ -2413,6 +2552,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             showToast('已复制 ' + selected.length + ' 个邮箱地址', 'success');
         });
 
+        // 批量复制Token按钮
         $('#batchCopyTokensBtn').on('click', function() {
             const selected = getSelectedAccounts();
             if (selected.length === 0) {
@@ -2425,17 +2565,17 @@ const HTML_PAGE = `<!DOCTYPE html>
             showToast('已复制 ' + selected.length + ' 个Token', 'success');
         });
 
-
+        // 快速筛选按钮事件
         $('.quick-filter-btn').on('click', function() {
             const filter = $(this).data('filter');
 
             if (quickFilterMode === filter) {
-     
+                // 再次点击相同按钮，取消筛选
                 quickFilterMode = null;
                 $('.quick-filter-btn').removeClass('active');
                 $('#clearFilterBtn').addClass('hidden');
             } else {
-    
+                // 应用新筛选
                 quickFilterMode = filter;
                 $('.quick-filter-btn').removeClass('active');
                 $(this).addClass('active');
@@ -2446,7 +2586,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             applyFilters(searchKeyword);
         });
 
-
+        // 清除筛选按钮
         $('#clearFilterBtn').on('click', function() {
             quickFilterMode = null;
             $searchInput.val('');
@@ -2469,7 +2609,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 }
                 const config = await response.json();
 
-
+                // 更新前端配置缓存
                 clientConfig.concurrency = config.concurrency || 15;
                 clientConfig.registerDelay = config.registerDelay || 2000;
 
@@ -2491,7 +2631,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
         $('#refreshBtn').on('click', loadAccounts);
 
-
+        // 统计卡片点击事件 - 切换过滤模式
         $('#totalAccountsCard').on('click', function() {
             filterMode = 'all';
             $('.stat-card').removeClass('active');
@@ -2524,7 +2664,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             renderTable();
         });
 
-
+        // 默认选中总账号卡片
         $('#totalAccountsCard').addClass('active');
 
         $('#clearLogBtn').on('click', function() {
@@ -2618,7 +2758,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 const text = await file.text();
                 const lines = text.split('\\n').filter(line => line.trim());
 
-
+                // 准备批量数据
                 const importData = [];
                 const emailSet = new Set();
 
@@ -2642,14 +2782,14 @@ const HTML_PAGE = `<!DOCTYPE html>
                         continue;
                     }
 
-             
+                    // 去重检查
                     if (!emailSet.has(email)) {
                         emailSet.add(email);
                         importData.push({ email, password, token, apikey });
                     }
                 }
 
-    
+                // 批量导入
                 const response = await fetch('/api/import-batch', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -2670,7 +2810,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         });
 
-
+        // 本地存储操作事件
         $('#exportLocalBtn').on('click', exportLocalAccounts);
 
         $('#importLocalBtn').on('click', function() {
@@ -2681,7 +2821,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             const file = e.target.files[0];
             if (!file) return;
             await importToLocal(file);
-            $(this).val(''); 
+            $(this).val(''); // 清空input，允许重复选择同一文件
         });
 
         $('#syncToServerBtn').on('click', syncLocalToServer);
@@ -2714,7 +2854,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                         return;
                     }
 
-            
+                    // 显示详细错误信息
                     if (result.isRunning) {
                         const msg = result.error + '\\n\\n' +
                             '当前进度：' + result.stats.success + ' 成功 / ' + result.stats.failed + ' 失败 / ' + result.stats.total + ' 已完成';
@@ -2746,14 +2886,14 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         });
 
-   
+        // ========== IndexedDB 操作库 ==========
         const DB_NAME = 'ZaiAccountsDB';
         const DB_VERSION = 1;
         const STORE_NAME = 'accounts';
 
         let db = null;
 
-
+        // 初始化 IndexedDB
         async function initIndexedDB() {
             return new Promise((resolve, reject) => {
                 const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -2765,7 +2905,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
                 request.onsuccess = () => {
                     db = request.result;
-           
+                    // loadAccounts() 会调用 loadLocalAccounts() 合并本地账号
                     resolve(db);
                 };
 
@@ -2782,7 +2922,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             });
         }
 
-      
+        // 保存账号到 IndexedDB
         async function saveToLocal(account) {
             if (!db) {
                 return false;
@@ -2817,7 +2957,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             });
         }
 
-
+        // 获取所有本地账号
         async function getAllLocalAccounts() {
             if (!db) return [];
 
@@ -2831,23 +2971,24 @@ const HTML_PAGE = `<!DOCTYPE html>
             });
         }
 
-
+        // 加载本地账号到界面
         async function loadLocalAccounts() {
             try {
                 const localAccounts = await getAllLocalAccounts();
 
-
+                // 合并服务端账号和本地账号到accounts数组
+                // 使用Map去重（以email为key）
                 const accountMap = new Map();
 
-         
+                // 先添加服务器账号
                 accounts.forEach(acc => {
                     accountMap.set(acc.email, acc);
                 });
 
-           
+                // 再添加本地账号（如果email不存在）
                 localAccounts.forEach(acc => {
                     if (!accountMap.has(acc.email)) {
-                      
+                        // 格式化为统一的账号格式
                         accountMap.set(acc.email, {
                             email: acc.email,
                             password: acc.password,
@@ -2859,11 +3000,11 @@ const HTML_PAGE = `<!DOCTYPE html>
                     }
                 });
 
-       
+                // 更新accounts和filteredAccounts
                 accounts = Array.from(accountMap.values());
                 filteredAccounts = accounts;
 
-             
+                // 更新统计（使用服务器的真实总数，如果有的话）
                 if (totalAccountsFromServer > 0) {
                     $totalAccounts.text(totalAccountsFromServer + ' (当前加载: ' + accounts.length + ')');
                 } else {
@@ -2873,14 +3014,14 @@ const HTML_PAGE = `<!DOCTYPE html>
                 $('#withApikeyCount').text(accounts.filter(a => a.apikey).length);
                 $('#withoutApikeyCount').text(accounts.filter(a => !a.apikey).length);
 
-          
+                // 重新渲染表格（保持当前过滤模式）
                 renderTable();
             } catch (error) {
-               
+                // 加载失败，静默处理
             }
         }
 
-     
+        // 导出本地账号为TXT
         async function exportLocalAccounts() {
             try {
                 const localAccounts = await getAllLocalAccounts();
@@ -2907,7 +3048,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-
+        // 导入TXT到本地存储
         async function importToLocal(file) {
             try {
                 const text = await file.text();
@@ -2941,7 +3082,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-
+        // 同步本地账号到服务器
         async function syncLocalToServer() {
             try {
                 const localAccounts = await getAllLocalAccounts();
@@ -2961,7 +3102,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 const result = await response.json();
 
                 if (response.ok && result.success) {
-        
+                    // 同步成功后删除本地已同步的账号
                     const transaction = db.transaction([STORE_NAME], 'readwrite');
                     const store = transaction.objectStore(STORE_NAME);
                     const emailIndex = store.index('email');
@@ -2977,7 +3118,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                         };
                     }
 
-            
+                    // 等待删除完成
                     transaction.oncomplete = async () => {
                         await loadLocalAccounts();
                         showToast(\`同步成功！已同步 \${result.synced} 个账号，已删除 \${deleted} 个本地记录\`, 'success');
@@ -2990,7 +3131,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-    
+        // 清空本地存储
         async function clearLocalAccounts() {
             if (!db) return;
 
@@ -3010,7 +3151,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             });
         }
 
-
+        // 重新获取单个账号的APIKEY
         async function refetchSingleApikey(email, token) {
             try {
                 const response = await fetch('/api/refetch-apikey', {
@@ -3023,7 +3164,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
                 if (result.success) {
                     showToast('✓ ' + email + ' APIKEY获取成功', 'success');
-    
+                    // 更新本地账号数据
                     await loadAccounts();
                     return { success: true, apikey: result.apikey };
                 } else {
@@ -3036,9 +3177,9 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-     
+        // 批量获取APIKEY
         async function batchRefetchApikey() {
-     
+            // 找出所有没有APIKEY的账号
             const accountsWithoutKey = accounts.filter(acc => !acc.apikey);
 
             if (accountsWithoutKey.length === 0) {
@@ -3054,14 +3195,14 @@ const HTML_PAGE = `<!DOCTYPE html>
             let failedCount = 0;
             const total = accountsWithoutKey.length;
 
-     
+            // 获取当前配置的并发数
             const concurrency = clientConfig.concurrency || 10;
             const delay = clientConfig.registerDelay || 1000;
 
             showToast('开始批量获取APIKEY，共 ' + total + ' 个账号（并发：' + concurrency + '）...', 'info');
             addLog('批量获取APIKEY：' + total + ' 个账号，并发数：' + concurrency, 'info');
 
-        
+            // 并发处理
             for (let i = 0; i < accountsWithoutKey.length; i += concurrency) {
                 const batch = accountsWithoutKey.slice(i, i + concurrency);
                 const batchPromises = batch.map(async (acc, idx) => {
@@ -3079,10 +3220,10 @@ const HTML_PAGE = `<!DOCTYPE html>
                     }
                 });
 
-            
+                // 等待当前批次完成
                 const results = await Promise.allSettled(batchPromises);
 
-      
+                // 统计结果
                 results.forEach(result => {
                     if (result.status === 'fulfilled' && result.value.success) {
                         successCount++;
@@ -3091,7 +3232,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                     }
                 });
 
-            
+                // 批次之间延迟
                 if (i + concurrency < accountsWithoutKey.length) {
                     await new Promise(resolve => setTimeout(resolve, delay));
                 }
@@ -3101,13 +3242,13 @@ const HTML_PAGE = `<!DOCTYPE html>
                       successCount > 0 ? 'success' : 'error');
             addLog('批量获取APIKEY完成：成功 ' + successCount + '，失败 ' + failedCount, 'info');
 
-           
+            // 刷新账号列表
             await loadAccounts();
         }
 
-
+        // 批量检测账号存活性
         async function batchCheckAccounts() {
-      
+            // 优先检测选中的账号，如果没有选中则检测所有账号
             const selectedAccounts = accounts.filter(acc => selectedEmails.has(acc.email));
             const toCheck = selectedAccounts.length > 0 ? selectedAccounts : accounts;
 
@@ -3145,7 +3286,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                     addLog('检测完成！正常: ' + activeCount + ' 个，失效: ' + inactiveCount + ' 个', 'success');
                     showToast('检测完成！正常: ' + activeCount + ' 个，失效: ' + inactiveCount + ' 个', 'success');
 
-                   
+                    // 刷新账号列表
                     await loadAccounts();
                 } else {
                     showToast('检测失败: ' + result.error, 'error');
@@ -3155,7 +3296,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-
+        // 删除失效账号
         async function deleteInactiveAccounts() {
             const inactiveCount = accounts.filter(acc => acc.status === 'inactive').length;
 
@@ -3220,14 +3361,14 @@ const HTML_PAGE = `<!DOCTYPE html>
                         filteredAccounts = accounts;
                         $totalAccounts.text(accounts.length);
                         renderTable();
-            
+                        // KV账号不需要保存到IndexedDB（已在服务器，无需本地备份）
                         break;
                     case 'local_account_added':
-            
-                        data.account.source = 'local'; 
+                        // KV保存失败，仅保存到IndexedDB
+                        data.account.source = 'local'; // 标记为仅本地账号
                         saveToLocal(data.account).then(() => {
                             addLog(\`💾 账号已保存到本地存储: \${data.account.email}\`, 'warning');
-                            loadLocalAccounts(); 
+                            loadLocalAccounts(); // 更新本地账号统计
                         }).catch(err => {
                             addLog(\`❌ 本地保存失败: \${data.account.email}\`, 'error');
                         });
@@ -3251,7 +3392,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         }
 
         $(document).ready(async function() {
-            await initIndexedDB(); 
+            await initIndexedDB(); // 初始化IndexedDB
             loadAccounts();
             loadSettings();
             connectSSE();
@@ -3260,20 +3401,20 @@ const HTML_PAGE = `<!DOCTYPE html>
 </body>
 </html>`;
 
-
+// HTTP 处理器
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
-
+  // 登录页面（无需鉴权）
   if (url.pathname === "/login") {
     return new Response(LOGIN_PAGE, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
- 
+  // 登录 API（无需鉴权）
   if (url.pathname === "/api/login" && req.method === "POST") {
     const clientIP = getClientIP(req);
 
-
+    // 检查 IP 是否被锁定
     const lockCheck = checkIPLocked(clientIP);
     if (lockCheck.locked) {
       return new Response(JSON.stringify({
@@ -3282,31 +3423,32 @@ async function handler(req: Request): Promise<Response> {
         remainingTime: lockCheck.remainingTime,
         code: "ACCOUNT_LOCKED"
       }), {
-        status: 429,  
+        status: 429,  // Too Many Requests
         headers: { "Content-Type": "application/json" }
       });
     }
 
     const body = await req.json();
     if (body.username === AUTH_USERNAME && body.password === AUTH_PASSWORD) {
-
+      // 登录成功，清除失败记录
       clearLoginFailure(clientIP);
       const sessionId = generateSessionId();
 
+      // 保存 session 到 KV，设置 24 小时过期
       const sessionKey = ["sessions", sessionId];
       try {
-        await kvSet(sessionKey, { createdAt: Date.now() }, { expireIn: 86400000 }); 
+        await kvSet(sessionKey, { createdAt: Date.now() }, { expireIn: 86400000 }); // 24小时过期
       } catch (error) {
         console.error("❌ Failed to save session to KV:", error);
 
-        
+        // Check if it's a quota exhausted error
         const errorMessage = error instanceof Error ? error.message : String(error);
         if (errorMessage.includes("quota is exhausted")) {
           return new Response(JSON.stringify({
             success: false,
             error: "KV 存储配额已耗尽，请清理数据或升级配额"
           }), {
-            status: 507, 
+            status: 507, // Insufficient Storage
             headers: { "Content-Type": "application/json" }
           });
         }
@@ -3325,7 +3467,7 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-
+    // 登录失败，记录失败次数
     recordLoginFailure(clientIP);
     const attempts = loginAttempts.get(clientIP)?.attempts || 0;
 
@@ -3339,14 +3481,14 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
-
+  // 鉴权检查（其他所有路径都需要验证）
   const auth = await checkAuth(req);
   if (!auth.authenticated) {
-
+    // 判断是 API 请求还是页面请求
     const isApiRequest = url.pathname.startsWith('/api/');
 
     if (isApiRequest) {
-
+      // API 请求返回 401 JSON 响应
       return new Response(JSON.stringify({
         success: false,
         error: "未授权访问，请先登录",
@@ -3356,7 +3498,7 @@ async function handler(req: Request): Promise<Response> {
         headers: { "Content-Type": "application/json" }
       });
     } else {
- 
+      // 页面请求返回 302 重定向
       return new Response(null, {
         status: 302,
         headers: { "Location": "/login" }
@@ -3364,10 +3506,10 @@ async function handler(req: Request): Promise<Response> {
     }
   }
 
-
+  // 登出 API
   if (url.pathname === "/api/logout" && req.method === "POST") {
     if (auth.sessionId) {
- 
+      // 从 KV 删除 session
       const sessionKey = ["sessions", auth.sessionId];
       await kvDelete(sessionKey);
     }
@@ -3376,25 +3518,25 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
- 
+  // 主页
   if (url.pathname === "/" || url.pathname === "/index.html") {
     return new Response(HTML_PAGE, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
-  
+  // 获取配置
   if (url.pathname === "/api/config" && req.method === "GET") {
-   
+    // 使用缓存加载配置
     const config = await loadConfigFromKV();
     return new Response(JSON.stringify(config), {
       headers: { "Content-Type": "application/json" }
     });
   }
 
-  
+  // 保存配置
   if (url.pathname === "/api/config" && req.method === "POST") {
     const body = await req.json();
 
-    
+    // 使用缓存保存函数
     await saveConfigToKV(body);
 
     return new Response(JSON.stringify({ success: true }), {
@@ -3402,32 +3544,32 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
-  
+  // KV统计信息
   if (url.pathname === "/api/kv-stats" && req.method === "GET") {
     resetDailyStats();
 
     const uptime = Math.floor((Date.now() - kvStats.startTime) / 1000);
     const uptimeStr = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`;
 
-    
+    // Deno Deploy免费限制
     const DAILY_WRITE_LIMIT = 10000;
     const DAILY_READ_LIMIT = 1000000;
 
     const stats = {
-      
+      // 当前会话统计
       session: {
         reads: kvStats.reads,
         writes: kvStats.writes,
         deletes: kvStats.deletes,
         uptime: uptimeStr
       },
-      
+      // 今日统计
       daily: {
         reads: kvStats.dailyReads,
         writes: kvStats.dailyWrites,
         date: kvStats.lastResetDate
       },
-    
+      // 配额使用率
       quota: {
         writesUsed: kvStats.dailyWrites,
         writesLimit: DAILY_WRITE_LIMIT,
@@ -3436,11 +3578,11 @@ async function handler(req: Request): Promise<Response> {
         readsLimit: DAILY_READ_LIMIT,
         readsPercent: ((kvStats.dailyReads / DAILY_READ_LIMIT) * 100).toFixed(2) + '%'
       },
-      
+      // 警告
       warnings: []
     };
 
-   
+    // 添加警告
     if (kvStats.dailyWrites > DAILY_WRITE_LIMIT * 0.8) {
       stats.warnings.push('⚠️ 写入配额已使用超过80%');
     }
@@ -3454,16 +3596,16 @@ async function handler(req: Request): Promise<Response> {
   }
 
 
-  
+  // SSE
   if (url.pathname === "/events") {
     const stream = new ReadableStream({
       start(controller) {
         sseClients.add(controller);
-     
+        // 发送当前状态
         const message = `data: ${JSON.stringify({ type: 'connected', isRunning })}\n\n`;
         controller.enqueue(new TextEncoder().encode(message));
 
-      
+        // 发送历史日志（最近50条）
         const recentLogs = logHistory.slice(-50);
         for (const log of recentLogs) {
           const logMessage = `data: ${JSON.stringify(log)}\n\n`;
@@ -3486,7 +3628,7 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
-
+  // 获取运行状态（新增 API）
   if (url.pathname === "/api/status") {
     return new Response(JSON.stringify({
       isRunning,
@@ -3497,16 +3639,16 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
-
+  // 账号列表
   if (url.pathname === "/api/accounts") {
     const url_obj = new URL(req.url);
     const page = parseInt(url_obj.searchParams.get('page') || '1');
     const pageSize = parseInt(url_obj.searchParams.get('pageSize') || '100');
 
-    
+    // 快速获取总数（使用缓存）
     const total = await getAccountTotal();
 
-  
+    // 只获取当前页需要的数据
     const accounts: any[] = [];
     const skip = (page - 1) * pageSize;
     let index = 0;
@@ -3517,7 +3659,7 @@ async function handler(req: Request): Promise<Response> {
         accounts.push(entry.value);
       }
       index++;
-
+      // 提前退出优化：已经收集够了就不再遍历
       if (accounts.length >= pageSize) {
         break;
       }
@@ -3534,10 +3676,10 @@ async function handler(req: Request): Promise<Response> {
     }), { headers: { "Content-Type": "application/json" } });
   }
 
-
+  // 导出
   if (url.pathname === "/api/export") {
     const lines: string[] = [];
-
+    // 限制最多导出10000个账号，避免数据过多导致超时
     const entries = kv.list({ prefix: ["zai_accounts"] }, { limit: 10000 });
     for await (const entry of entries) {
       const data = entry.value as any;
@@ -4086,9 +4228,12 @@ async function handler(req: Request): Promise<Response> {
   return new Response("Not Found", { status: 404 });
 }
 
+// Initialize KV database before loading config
 await initKV();
 
+// 启动时从 KV 加载配置和日志
 (async () => {
+  // 加载配置
   const configKey = ["config", "register"];
   const savedConfig = await kvGet(configKey);
   if (savedConfig.value) {
@@ -4096,6 +4241,7 @@ await initKV();
     console.log("✓ 已加载保存的配置");
   }
 
+  // 清理历史日志（重启时清空）
   const logKey = ["logs", "recent"];
   try {
     await kvDelete(logKey);
@@ -4111,3 +4257,10 @@ console.log(`🔑 登录密码: ${AUTH_PASSWORD}`);
 console.log(`💡 访问 http://localhost:${PORT}/login 登录`);
 await serve(handler, { port: PORT });
 
+/*
+  📦 源码地址:
+  https://github.com/dext7r/ZtoApi/tree/main/deno/zai/zai_register.ts
+  |
+  💬 交流讨论: https://linux.do/t/topic/1009939
+──────────────────────────────────────────────────
+*/
