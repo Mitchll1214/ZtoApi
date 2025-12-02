@@ -8,7 +8,7 @@ export {};
 // Config variables from environment
 const DEFAULT_UPSTREAM_URL = "https://chat.z.ai/api/chat/completions";
 const DEFAULT_FE_VERSION = "prod-fe-1.0.98";
-const DEFAULT_SIGNATURE_SECRET = "junjie";
+const DEFAULT_SIGNATURE_SECRET = "key-@@@@)))()((9))-xxxx&&&%%%%%";
 const DEFAULT_TOKEN_ENDPOINT = "https://chat.z.ai/api/v1/auths/";
 const DEFAULT_MODELS_ENDPOINT = "https://chat.z.ai/api/models";
 const TOKEN_CACHE_SAFETY_MARGIN_MS = 30_000;
