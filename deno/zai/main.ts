@@ -6,7 +6,16 @@
 export {};
 
 // Config variables from environment
-const UPSTREAM_URL = Deno.env.get("UPSTREAM_URL") || "https://chat.z.ai/api/chat/completions";
+const DEFAULT_UPSTREAM_URL = "https://chat.z.ai/api/chat/completions";
+const DEFAULT_FE_VERSION = "prod-fe-1.0.98";
+const DEFAULT_SIGNATURE_SECRET = "key-@@@@)))()((9))-xxxx&&&%%%%%";
+const DEFAULT_TOKEN_ENDPOINT = "https://chat.z.ai/api/v1/auths/";
+const DEFAULT_MODELS_ENDPOINT = "https://chat.z.ai/api/models";
+const TOKEN_CACHE_SAFETY_MARGIN_MS = 30_000;
+const MODELS_CACHE_DEFAULT_TTL_MS = 5 * 60_000;
+
+const UPSTREAM_URL = Deno.env.get("UPSTREAM_URL") ||
+  Deno.env.get("ZAI_UPSTREAM_URL") || DEFAULT_UPSTREAM_URL;
 const DEFAULT_KEY = Deno.env.get("DEFAULT_KEY") || "sk-your-key";
 const ZAI_TOKEN = Deno.env.get("ZAI_TOKEN") || "";
 const KV_URL = Deno.env.get("KV_URL") || "";  // Remote KV database URL
@@ -16,14 +25,24 @@ const DEBUG_MODE = Deno.env.get("DEBUG_MODE") === "true" || true;
 const DEFAULT_STREAM = Deno.env.get("DEFAULT_STREAM") !== "false";
 const DASHBOARD_ENABLED = Deno.env.get("DASHBOARD_ENABLED") !== "false";
 const ENABLE_THINKING = Deno.env.get("ENABLE_THINKING") === "true";
+const FE_VERSION = Deno.env.get("ZAI_FE_VERSION") || DEFAULT_FE_VERSION;
+const SIGNATURE_SECRET = Deno.env.get("ZAI_SIGNATURE_SECRET") ||
+  DEFAULT_SIGNATURE_SECRET;
+const TOKEN_ENDPOINT = Deno.env.get("ZAI_TOKEN_ENDPOINT") ||
+  DEFAULT_TOKEN_ENDPOINT;
+const MODELS_ENDPOINT = Deno.env.get("ZAI_MODELS_ENDPOINT") ||
+  DEFAULT_MODELS_ENDPOINT;
+const MODELS_COOKIE = Deno.env.get("ZAI_MODELS_COOKIE") || "";
+const parsedModelsCacheTtl = Number(Deno.env.get("ZAI_MODELS_CACHE_TTL_MS"));
+const MODELS_CACHE_TTL_MS = Number.isFinite(parsedModelsCacheTtl) &&
+    parsedModelsCacheTtl > 0
+  ? parsedModelsCacheTtl
+  : MODELS_CACHE_DEFAULT_TTL_MS;
 
 // Admin authentication configuration
 const ADMIN_USERNAME = Deno.env.get("ADMIN_USERNAME") || "admin";
 const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD") || "123456";
 const ADMIN_ENABLED = Deno.env.get("ADMIN_ENABLED") !== "false";
-
-// Browser headers for upstream requests (2025-09-30 更新：修复426错误)
-const X_FE_VERSION = "prod-fe-1.0.94"; // 更新：1.0.70 → 1.0.94
 
 // Browser fingerprint generator
 function generateBrowserHeaders(chatID: string, authToken: string): Record<string, string> {
@@ -52,7 +71,7 @@ function generateBrowserHeaders(chatID: string, authToken: string): Record<strin
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
-    "X-FE-Version": X_FE_VERSION,
+    "X-FE-Version": FE_VERSION,
     "Origin": ORIGIN_BASE,
     "Referer": `${ORIGIN_BASE}/c/${chatID}`,
     "Priority": "u=1, i",
@@ -74,7 +93,260 @@ const KV_TOKEN_POOL_ENABLED = !!KV_URL;
 // 4. Anonymous Token (auto-fetch from Z.ai)
 
 // Thinking tags mode
-const THINK_TAGS_MODE = "strip"; // strip | think | raw
+const THINK_TAGS_MODE: "strip" | "think" | "raw" = (() => {
+  const value = Deno.env.get("THINK_TAGS_MODE");
+  if (value === "think" || value === "raw" || value === "strip") {
+    return value;
+  }
+  return "strip";
+})(); // strip | think | raw
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+const STATIC_MODEL_MAPPING: Record<string, string> = {
+  "GLM-4.5": "0727-360B-API",
+  "GLM-4.6": "GLM-4-6-API-V1",
+};
+
+let dynamicModelMapping: Record<string, string> = {};
+
+type JwtPayload = Record<string, unknown>;
+
+type ModelApiItem = {
+  id?: string;
+  name?: string;
+  owned_by?: string;
+  [key: string]: unknown;
+};
+
+type ModelSummary = {
+  id: string;
+  object: "model";
+  owned_by: string;
+  name?: string;
+};
+
+type TokenCache = {
+  value: string;
+  payload: JwtPayload;
+  expiresAt: number;
+};
+
+let cachedToken: TokenCache | null = null;
+let modelsCache: { value: ModelSummary[]; expiresAt: number } | null = null;
+let modelsFetchTask: Promise<ModelSummary[]> | null = null;
+
+function resolveTargetModel(model: string): string {
+  return dynamicModelMapping[model] ?? STATIC_MODEL_MAPPING[model] ?? model;
+}
+
+function decodeJwtPayload(token: string): JwtPayload {
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new Error("[Token Error] JWT 结构不合法");
+  }
+
+  let payload = parts[1];
+  const padding = (4 - (payload.length % 4)) % 4;
+  if (padding > 0) payload += "=".repeat(padding);
+
+  const decoded = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
+  return JSON.parse(decoded);
+}
+
+function resolveTokenExpiry(payload: JwtPayload): number {
+  const now = Date.now();
+  const expRaw = payload?.exp;
+  const expNumber = typeof expRaw === "number" ? expRaw : Number(expRaw);
+  if (Number.isFinite(expNumber) && expNumber > 0) {
+    return Math.max(now, expNumber * 1000 - TOKEN_CACHE_SAFETY_MARGIN_MS);
+  }
+  return now + 60_000;
+}
+
+async function getToken(): Promise<{ token: string; payload: JwtPayload }> {
+  if (cachedToken && cachedToken.expiresAt > Date.now()) {
+    return { token: cachedToken.value, payload: cachedToken.payload };
+  }
+
+  const response = await fetch(TOKEN_ENDPOINT);
+  if (!response.ok) {
+    throw new Error(`[Token Error] 请求失败，状态码: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const token = data?.token;
+  if (typeof token !== "string" || token.length === 0) {
+    throw new Error("[Token Error] 响应缺少 token 字段");
+  }
+
+  const payload = decodeJwtPayload(token);
+  const expiresAt = resolveTokenExpiry(payload);
+
+  cachedToken = { value: token, payload, expiresAt };
+  return { token, payload };
+}
+
+function normalizeModel(item: ModelApiItem): ModelSummary | null {
+  const openaiInfo = typeof item.openai === "object" && item.openai !== null
+    ? item.openai as Record<string, unknown>
+    : undefined;
+  const idCandidate = typeof item.id === "string" && item.id.length > 0
+    ? item.id
+    : typeof item.name === "string" && item.name.length > 0
+    ? item.name
+    : typeof openaiInfo?.id === "string"
+    ? String(openaiInfo.id)
+    : "";
+
+  if (!idCandidate) {
+    return null;
+  }
+
+  const nameCandidate = typeof item.name === "string" && item.name.length > 0
+    ? item.name
+    : typeof openaiInfo?.name === "string"
+    ? String(openaiInfo.name)
+    : undefined;
+
+  const ownedByCandidate =
+    typeof item.owned_by === "string" && item.owned_by.length > 0
+      ? item.owned_by
+      : typeof openaiInfo?.owned_by === "string"
+      ? String(openaiInfo.owned_by)
+      : "z.ai";
+
+  return {
+    id: idCandidate,
+    object: "model",
+    owned_by: ownedByCandidate,
+    name: nameCandidate,
+  };
+}
+
+function updateDynamicModelMapping(models: ModelSummary[]): void {
+  const nextMapping: Record<string, string> = {};
+  for (const model of models) {
+    nextMapping[model.id] = model.id;
+    if (model.name) {
+      nextMapping[model.name] = model.id;
+    }
+  }
+  dynamicModelMapping = nextMapping;
+}
+
+async function fetchModelsFromUpstream(): Promise<ModelSummary[]> {
+  const { token } = await getToken();
+  const headers = new Headers({
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${token}`,
+    "Origin": ORIGIN_BASE,
+    "Referer": "https://chat.z.ai/",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "User-Agent": "Mozilla/5.0 (compatible; ZAI Proxy/1.0; +https://chat.z.ai)",
+  });
+
+  if (MODELS_COOKIE) {
+    headers.set("Cookie", MODELS_COOKIE);
+  }
+
+  const response = await fetch(MODELS_ENDPOINT, {
+    method: "GET",
+    headers,
+  });
+
+  if (!response.ok) {
+    const statusMessage =
+      `[Models Error] 非 200 响应，状态: ${response.status} ${response.statusText}`;
+    const preview = await response.text().catch(() => "");
+    if (preview) {
+      console.error(`[Models Error] 响应内容片段: ${preview.slice(0, 500)}`);
+    }
+    throw new Error(statusMessage);
+  }
+
+  const result = await response.json();
+  const list: ModelApiItem[] = Array.isArray(result?.data)
+    ? (result.data as ModelApiItem[])
+    : [];
+  const normalized = list
+    .map((item) => normalizeModel(item))
+    .filter((item): item is ModelSummary => item !== null);
+
+  updateDynamicModelMapping(normalized);
+
+  return normalized;
+}
+
+async function getModels(): Promise<ModelSummary[]> {
+  if (modelsCache && modelsCache.expiresAt > Date.now()) {
+    updateDynamicModelMapping(modelsCache.value);
+    return modelsCache.value;
+  }
+
+  if (modelsFetchTask) {
+    return modelsFetchTask;
+  }
+
+  modelsFetchTask = (async () => {
+    const models = await fetchModelsFromUpstream();
+    const expiresAt = Date.now() + MODELS_CACHE_TTL_MS;
+    modelsCache = { value: models, expiresAt };
+    return models;
+  })();
+
+  try {
+    return await modelsFetchTask;
+  } finally {
+    modelsFetchTask = null;
+  }
+}
+
+async function hmacSha256(
+  key: string | Uint8Array,
+  data: string,
+): Promise<string> {
+  const keyData = typeof key === "string" ? textEncoder.encode(key) : key;
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    keyData,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    cryptoKey,
+    textEncoder.encode(data),
+  );
+  return Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function generateSignature(
+  metadataSeed: string,
+  latestUserContent: string,
+  timestamp: number,
+): Promise<{ signature: string; timestamp: number }> {
+  const base64Content = btoa(String.fromCharCode(...textEncoder.encode(latestUserContent)));
+  const composite = `${metadataSeed}|${base64Content}|${timestamp}`;
+  const period = Math.floor(timestamp / (5 * 60 * 1000));
+  const midKey = await hmacSha256(SIGNATURE_SECRET, period.toString());
+  const signature = await hmacSha256(midKey, composite);
+  return { signature, timestamp };
+}
+
+function extractLatestUserContent(messages: Message[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      return messages[i].content || "";
+    }
+  }
+  return "";
+}
 
 // Request statistics
 interface RequestStats {
@@ -511,7 +783,7 @@ async function getHourlyStats(hours = 24): Promise<HourlyStats[]> {
   const prefix = ["stats", "hourly"];
 
   try {
-    const entries = kv.list<HourlyStats>({ prefix, reverse: true, limit: hours });
+    const entries = kv.list<HourlyStats>({ prefix }, { limit: hours });
     for await (const entry of entries) {
       result.push(entry.value);
     }
@@ -530,7 +802,7 @@ async function getDailyStats(days = 30): Promise<DailyStats[]> {
   const prefix = ["stats", "daily"];
 
   try {
-    const entries = kv.list<DailyStats>({ prefix, reverse: true, limit: days });
+    const entries = kv.list<DailyStats>({ prefix }, { limit: days });
     for await (const entry of entries) {
       result.push(entry.value);
     }
@@ -806,36 +1078,8 @@ function getClientIP(req: Request): string {
 // Get anonymous token
 async function getAnonymousToken(): Promise<string> {
   try {
-    // 使用 Chrome 140 的 User-Agent
-    const chromeVersion = 140;
-    const userAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion}.0.0.0 Safari/537.36`;
-    const secChUa = `"Chromium";v="${chromeVersion}", "Not=A?Brand";v="24", "Google Chrome";v="${chromeVersion}"`;
-
-    const response = await fetch(`${ORIGIN_BASE}/api/v1/auths/`, {
-      method: "GET",
-      headers: {
-        "User-Agent": userAgent,
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "X-FE-Version": X_FE_VERSION,
-        "sec-ch-ua": secChUa,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "Origin": ORIGIN_BASE,
-        "Referer": `${ORIGIN_BASE}/`,
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to get anon token: ${response.status}`);
-    }
-
-    const data = await response.json();
-    if (!data.token) {
-      throw new Error("Empty token in response");
-    }
-
-    return data.token;
+    const { token } = await getToken();
+    return token;
   } catch (error) {
     debugLog("Anonymous token error:", error);
     throw error;
@@ -875,21 +1119,39 @@ async function callUpstream(
   upstreamReq: UpstreamRequest,
   chatID: string,
   authToken: string,
+  tokenPayload: JwtPayload,
 ): Promise<Response> {
+  const userIdRaw = tokenPayload?.id ?? tokenPayload?.user_id;
+  const userId = typeof userIdRaw === "string"
+    ? userIdRaw
+    : String(userIdRaw ?? "");
+
+  if (!userId) {
+    throw new Error("[Token Error] JWT 缺少用户标识字段");
+  }
+
+  const requestId = crypto.randomUUID();
+  const timestamp = Date.now();
+  const targetModel = resolveTargetModel(upstreamReq.model);
+  const latestUserContent = extractLatestUserContent(upstreamReq.messages);
+  const metadataSeed = `requestId,${requestId},timestamp,${timestamp},user_id,${userId}`;
+  const { signature } = await generateSignature(
+    metadataSeed,
+    latestUserContent,
+    timestamp,
+  );
+
+  upstreamReq.model = targetModel;
+  if (upstreamReq.model_item) {
+    upstreamReq.model_item.id = targetModel;
+    upstreamReq.model_item.name = targetModel;
+  }
+
   // 构建请求体
   const reqBody = JSON.stringify(upstreamReq);
 
   debugLog("Calling upstream:", UPSTREAM_URL);
   debugLog("Request body:", reqBody);
-
-  // 生成 X-Signature - 基于请求体的 SHA-256 哈希（426错误修复）
-  const encoder = new TextEncoder();
-  const data = encoder.encode(reqBody);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const signature = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
-
-  debugLog("Generated X-Signature:", signature);
 
   // Generate dynamic browser headers for better fingerprinting
   const headers: Record<string, string> = generateBrowserHeaders(chatID, authToken);
@@ -903,10 +1165,16 @@ async function callUpstream(
   headers["sec-fetch-mode"] = "cors";
   headers["sec-fetch-site"] = "same-origin";
 
-  // 添加 Cookie
-  headers["Cookie"] = `token=${authToken}`;
+  const url = new URL(UPSTREAM_URL);
+  url.searchParams.set("timestamp", timestamp.toString());
+  url.searchParams.set("requestId", requestId);
+  url.searchParams.set("user_id", userId);
+  url.searchParams.set("token", authToken);
+  url.searchParams.set("current_url", `${ORIGIN_BASE}/c/${chatID}`);
+  url.searchParams.set("pathname", `/c/${chatID}`);
+  url.searchParams.set("signature_timestamp", timestamp.toString());
 
-  const response = await fetch(UPSTREAM_URL, {
+  const response = await fetch(url, {
     method: "POST",
     headers: headers,
     body: reqBody,
@@ -921,6 +1189,7 @@ async function handleStreamResponse(
   upstreamReq: UpstreamRequest,
   chatID: string,
   authToken: string,
+  tokenPayload: JwtPayload,
   startTime: number,
   path: string,
   clientIP: string,
@@ -930,7 +1199,12 @@ async function handleStreamResponse(
 ): Promise<Response> {
   debugLog("Handling stream response, chat_id:", chatID);
 
-  const upstreamResp = await callUpstream(upstreamReq, chatID, authToken);
+  const upstreamResp = await callUpstream(
+    upstreamReq,
+    chatID,
+    authToken,
+    tokenPayload,
+  );
 
   if (!upstreamResp.ok) {
     debugLog("Upstream error status:", upstreamResp.status);
@@ -998,7 +1272,7 @@ async function handleStreamResponse(
             id: `chatcmpl-${Date.now()}`,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
-            model: MODEL_NAME,
+            model,
             choices: [{
               index: 0,
               delta: { role: "assistant" },
@@ -1035,7 +1309,7 @@ async function handleStreamResponse(
                   id: `chatcmpl-${Date.now()}`,
                   object: "chat.completion.chunk",
                   created: Math.floor(Date.now() / 1000),
-                  model: MODEL_NAME,
+                  model,
                   choices: [{
                     index: 0,
                     delta: {},
@@ -1064,7 +1338,7 @@ async function handleStreamResponse(
                     id: `chatcmpl-${Date.now()}`,
                     object: "chat.completion.chunk",
                     created: Math.floor(Date.now() / 1000),
-                    model: MODEL_NAME,
+                    model,
                     choices: [{
                       index: 0,
                       delta: { content: out },
@@ -1077,11 +1351,11 @@ async function handleStreamResponse(
               // Check if done
               if (upstreamData.data.done || upstreamData.data.phase === "done") {
                 debugLog("Stream done");
-                const endChunk: OpenAIResponse = {
-                  id: `chatcmpl-${Date.now()}`,
-                  object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
-                  model: MODEL_NAME,
+          const endChunk: OpenAIResponse = {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model,
                   choices: [{
                     index: 0,
                     delta: {},
@@ -1139,6 +1413,7 @@ async function handleNonStreamResponse(
   upstreamReq: UpstreamRequest,
   chatID: string,
   authToken: string,
+  tokenPayload: JwtPayload,
   startTime: number,
   path: string,
   clientIP: string,
@@ -1148,7 +1423,12 @@ async function handleNonStreamResponse(
 ): Promise<Response> {
   debugLog("Handling non-stream response, chat_id:", chatID);
 
-  const upstreamResp = await callUpstream(upstreamReq, chatID, authToken);
+  const upstreamResp = await callUpstream(
+    upstreamReq,
+    chatID,
+    authToken,
+    tokenPayload,
+  );
 
   if (!upstreamResp.ok) {
     debugLog("Upstream error status:", upstreamResp.status);
@@ -1209,7 +1489,7 @@ async function handleNonStreamResponse(
         if (upstreamData.data.delta_content) {
           let out = upstreamData.data.delta_content;
           if (upstreamData.data.phase === "thinking") {
-            out = transformThinking(out, enableThinking);
+            out = transformThinking(out);
           }
           if (out) {
             fullContent += out;
@@ -1229,7 +1509,7 @@ async function handleNonStreamResponse(
     id: `chatcmpl-${Date.now()}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: MODEL_NAME,
+    model,
     choices: [{
       index: 0,
       message: {
@@ -1273,64 +1553,21 @@ async function handleModels(req: Request): Promise<Response> {
   const userAgent = req.headers.get("User-Agent") || "";
 
   try {
-    // Get token (ZAI_TOKEN or anonymous)
-    let token = ZAI_TOKEN;
-    if (!token) {
-      token = await getAnonymousToken();
-      if (!token) {
-        debugLog("Failed to get anonymous token for models request");
-        const duration = Date.now() - startTime;
-        recordRequestStats(startTime, "/v1/models", 500, 0, undefined, undefined, undefined, clientIP);
-        addLiveRequest("GET", "/v1/models", 500, duration, clientIP, userAgent);
-        return new Response(JSON.stringify({ error: "Failed to authenticate" }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    // Request models from upstream
-    const chromeVersion = 140;
-    const modelsUserAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion}.0.0.0 Safari/537.36`;
-    const secChUa = `"Chromium";v="${chromeVersion}", "Not=A?Brand";v="24", "Google Chrome";v="${chromeVersion}"`;
-
-    const upstreamResponse = await fetch("https://chat.z.ai/api/models", {
-      method: "GET",
-      headers: {
-        "Accept": "application/json",
-        "Accept-Language": "zh-CN",
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`,
-        "User-Agent": modelsUserAgent,
-        "Referer": "https://chat.z.ai/",
-        "X-FE-Version": X_FE_VERSION,
-        "sec-ch-ua": secChUa,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-      },
-    });
-
-    if (!upstreamResponse.ok) {
-      debugLog(`Upstream models request failed: ${upstreamResponse.status}`);
-      throw new Error(`Upstream returned ${upstreamResponse.status}`);
-    }
-
-    const upstreamData = await upstreamResponse.json();
-
-    // Transform to OpenAI format
-    const models = upstreamData.data.map((model: any) => ({
-      id: model.name || model.id,
-      object: "model",
-      created: Math.floor(Date.now() / 1000),
-      owned_by: "z.ai",
-    }));
+    const models = await getModels();
+    const metadata = modelsCache
+      ? { cached_until: modelsCache.expiresAt }
+      : undefined;
 
     const response = {
       object: "list",
-      data: models,
+      data: models.map((model) => ({
+        id: model.id,
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: model.owned_by,
+        name: model.name,
+      })),
+      metadata,
     };
 
     const headers = new Headers({ "Content-Type": "application/json" });
@@ -1346,14 +1583,25 @@ async function handleModels(req: Request): Promise<Response> {
     debugLog(`Error fetching models: ${error}`);
 
     // Fallback to default model
+    const fallbackId = resolveTargetModel(MODEL_NAME);
+    const fallbackSummary: ModelSummary = {
+      id: fallbackId,
+      object: "model",
+      owned_by: "z.ai",
+      name: MODEL_NAME,
+    };
+    updateDynamicModelMapping([fallbackSummary]);
+
     const response = {
       object: "list",
       data: [{
-        id: MODEL_NAME,
+        id: fallbackSummary.id,
         object: "model",
         created: Math.floor(Date.now() / 1000),
-        owned_by: "z.ai",
+        owned_by: fallbackSummary.owned_by,
+        name: fallbackSummary.name,
       }],
+      metadata: { fallback: true },
     };
 
     const headers = new Headers({ "Content-Type": "application/json" });
@@ -1432,6 +1680,9 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const chatID = `${Date.now()}-${Math.floor(Math.random() * 100000)}`;
   const msgID = `${Date.now()}`;
 
+  const requestedModel = body.model || MODEL_NAME;
+  const targetModel = resolveTargetModel(requestedModel);
+
   // Determine thinking setting
   const enableThinking = body.enable_thinking !== undefined
     ? body.enable_thinking
@@ -1443,7 +1694,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     stream: true,
     chat_id: chatID,
     id: msgID,
-    model: "0727-360B-API",
+    model: targetModel,
     messages: body.messages,
     params: {},
     features: {
@@ -1455,9 +1706,9 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     },
     mcp_servers: [],
     model_item: {
-      id: "0727-360B-API",
-      name: "GLM-4.5",
-      owned_by: "openai",
+      id: targetModel,
+      name: requestedModel,
+      owned_by: "z.ai",
     },
     tool_servers: [],
     variables: {
@@ -1525,17 +1776,43 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     });
   }
 
+  let tokenPayload: JwtPayload;
+  try {
+    tokenPayload = decodeJwtPayload(authToken);
+  } catch (error) {
+    debugLog("Failed to decode provided token payload, attempting fallback:", error);
+    try {
+      const fresh = await getToken();
+      authToken = fresh.token;
+      tokenPayload = fresh.payload;
+      debugLog("Using freshly fetched token for upstream call");
+    } catch (fallbackError) {
+      debugLog("Fallback token retrieval failed:", fallbackError);
+      return new Response(JSON.stringify({
+        error: {
+          message: "Failed to prepare upstream authentication token",
+          type: "server_error",
+          code: "token_decode_failed"
+        }
+      }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }
+
   // Call upstream
   if (body.stream) {
     return await handleStreamResponse(
       upstreamReq,
       chatID,
       authToken,
+      tokenPayload,
       startTime,
       path,
       clientIP,
       userAgent,
-      body.model,
+      requestedModel,
       body.messages.length,
     );
   } else {
@@ -1543,11 +1820,12 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       upstreamReq,
       chatID,
       authToken,
+      tokenPayload,
       startTime,
       path,
       clientIP,
       userAgent,
-      body.model,
+      requestedModel,
       body.messages.length,
     );
   }
@@ -4092,7 +4370,7 @@ async function handler(req: Request): Promise<Response> {
 
     // Admin logout API
     if (path === "/admin/api/logout" && req.method === "POST") {
-      if (auth.sessionId) {
+      if (auth.sessionId && kv) {
         const sessionKey = ["admin_sessions", auth.sessionId];
         await kv.delete(sessionKey);
       }
